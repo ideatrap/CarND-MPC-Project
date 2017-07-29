@@ -8,6 +8,7 @@
 #include "Eigen-3.3/Eigen/QR"
 #include "MPC.h"
 #include "json.hpp"
+#include <math.h>
 
 // for convenience
 using json = nlohmann::json;
@@ -41,6 +42,7 @@ double polyeval(Eigen::VectorXd coeffs, double x) {
   return result;
 }
 
+
 // Fit a polynomial.
 // Adapted from
 // https://github.com/JuliaMath/Polynomials.jl/blob/master/src/Polynomials.jl#L676-L716
@@ -50,6 +52,7 @@ Eigen::VectorXd polyfit(Eigen::VectorXd xvals, Eigen::VectorXd yvals,
   assert(order >= 1 && order <= xvals.size() - 1);
   Eigen::MatrixXd A(xvals.size(), order + 1);
 
+  Eigen::VectorXd yvals_ = Eigen::VectorXd::Map(yvals.data(), yvals.size());
   for (int i = 0; i < xvals.size(); i++) {
     A(i, 0) = 1.0;
   }
@@ -61,7 +64,7 @@ Eigen::VectorXd polyfit(Eigen::VectorXd xvals, Eigen::VectorXd yvals,
   }
 
   auto Q = A.householderQr();
-  auto result = Q.solve(yvals);
+  auto result = Q.solve(yvals_);
   return result;
 }
 
@@ -77,7 +80,8 @@ int main() {
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
     string sdata = string(data).substr(0, length);
-    cout << sdata << endl;
+    //cout << "sdata: " << sdata << endl;
+    //cout << "   " << endl;
     if (sdata.size() > 2 && sdata[0] == '4' && sdata[1] == '2') {
       string s = hasData(sdata);
       if (s != "") {
@@ -87,8 +91,8 @@ int main() {
           // j[1] is the data JSON object
           vector<double> ptsx = j[1]["ptsx"];
           vector<double> ptsy = j[1]["ptsy"];
-          double px = j[1]["x"];
-          double py = j[1]["y"];
+          double px = j[1]["x"]; // vehicle's current position - x
+          double py = j[1]["y"]; // vehicle's current position - y
           double psi = j[1]["psi"];
           double v = j[1]["speed"];
 
@@ -98,22 +102,75 @@ int main() {
           * Both are in between [-1, 1].
           *
           */
-          double steer_value;
-          double throttle_value;
+
+          double steer_angle = j[1]["steering_angle"];
+          double throttle_reading = j[1]["throttle"];
+		  cout <<  "steer value: " <<  steer_angle <<  ", throttle value: " << throttle_reading << endl;
+          //Find state at 100ms in the future
+          double latency = 0.1;
+
+          const int n_points = ptsx.size();
+
+          //Transform the co-ords and convert to Eigen::VectorXd
+          Eigen::VectorXd ptsx_vector(n_points), ptsy_vector(n_points);
+          for(int i = 0; i < n_points; ++i) {
+              double x = ptsx[i] - px;
+              double y = ptsy[i] - py;
+              ptsx_vector[i] = x * cos(-psi) - y * sin(-psi);
+              ptsy_vector[i] = y * cos(-psi) + x * sin(-psi);
+          }
+
+          //fit a three degree polynomial to waypoints
+          auto coeffs = polyfit(ptsx_vector, ptsy_vector, 3);
+
+          // Calculate the car's future position after latency time
+          double psi_pred = (-v* steer_angle * latency)/2.67; //orientation
+          double px_pred = v*cos(psi) * latency; //assuming the same speed, predicted x position
+          double v_pred = v + throttle_reading * latency;
+
+          // predict the cross track error by putting car in future position (x = px)
+          // y = 0 for current location
+          double cte = polyeval(coeffs, px_pred);//cross track error
+
+          //Calculate the orientatiin error
+          double derivative = coeffs[1] + 2*coeffs[2]*px_pred + 3*coeffs[3]*px_pred*px_pred;
+          double epsi = psi_pred - atan(derivative); //orientation error
+
+          Eigen::VectorXd state(6);
+          // the car is always at the center of its own position
+		  state << px_pred, 0, psi_pred, v_pred, cte, epsi;
+
+          //Calculate steeering angle and throttle using MPC.
+          auto vars = mpc.Solve(state, coeffs);
+
+          double steer_value = vars[0];
+          double throttle_value = vars[1];
+
+          //cout <<  "steer applying: " <<  steer_value <<  ", throttle applying: " << throttle_value << endl;
+          cout << "  "<< endl;
+
 
           json msgJson;
           // NOTE: Remember to divide by deg2rad(25) before you send the steering value back.
           // Otherwise the values will be in between [-deg2rad(25), deg2rad(25] instead of [-1, 1].
-          msgJson["steering_angle"] = steer_value;
+          msgJson["steering_angle"] = -steer_value;
           msgJson["throttle"] = throttle_value;
 
-          //Display the MPC predicted trajectory 
+
+          //Display the MPC predicted trajectory
+          //add (x,y) points to list here, points are in reference to the vehicle's coordinate system
+          // the points in the simulator are connected by a Green line
           vector<double> mpc_x_vals;
           vector<double> mpc_y_vals;
 
-          //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
-          // the points in the simulator are connected by a Green line
+          // not starting 0 to eliminate points behind the car
+          for (int i = 4; i < vars.size(); i+=2) {
+            mpc_x_vals.push_back(vars[i]);
+            mpc_y_vals.push_back(vars[i+1]);
+          }
 
+
+           // x_start 0 y_start 15 delta_start 90 a_start 104 N = 15
           msgJson["mpc_x"] = mpc_x_vals;
           msgJson["mpc_y"] = mpc_y_vals;
 
@@ -121,15 +178,21 @@ int main() {
           vector<double> next_x_vals;
           vector<double> next_y_vals;
 
-          //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
+          //add (x,y) points to list here, points are in reference to the vehicle's coordinate system
           // the points in the simulator are connected by a Yellow line
+
+          for (int i = 1; i < n_points ; ++i ) {
+                next_x_vals.push_back(ptsx_vector[i]);
+                next_y_vals.push_back(ptsy_vector[i]);
+          }
 
           msgJson["next_x"] = next_x_vals;
           msgJson["next_y"] = next_y_vals;
 
 
           auto msg = "42[\"steer\"," + msgJson.dump() + "]";
-          std::cout << msg << std::endl;
+          //std::cout << msg << std::endl;
+		  //cout << " "<< endl;
           // Latency
           // The purpose is to mimic real driving conditions where
           // the car does actuate the commands instantly.
@@ -159,7 +222,6 @@ int main() {
     if (req.getUrl().valueLength == 1) {
       res->end(s.data(), s.length());
     } else {
-      // i guess this should be done more gracefully?
       res->end(nullptr, 0);
     }
   });
