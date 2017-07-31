@@ -147,7 +147,7 @@ MPC::~MPC() {}
 vector<double>
 MPC::Solve(Eigen::VectorXd state, Eigen::VectorXd coeffs) {
     bool ok = true;
-    // for clarity - indx is the index into an array of N elements, the size of an element of being size_t
+    // indx is the position of the N elements
     size_t indx;
     typedef CPPAD_TESTVECTOR(double) Dvector;
 
